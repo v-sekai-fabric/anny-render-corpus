@@ -354,8 +354,8 @@ def main():
     ap.add_argument("--append", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
-    import mitsuba as mi
-    mi.set_variant("llvm_ad_rgb")
+    import mtoon_forward as forward
+    forward.set_wide_variant()  # cuda where there is a GPU, else llvm, else scalar
     if args.self_test:
         return self_test()
     if args.count is None:

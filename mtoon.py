@@ -66,71 +66,41 @@ def evaluate(dot_nl, dot_nv, base, shade, light_color=(1.0, 1.0, 1.0), **kw):
     return col + rim_term(dot_nv, light_color, **kw), t
 
 
-def scene_dict(base, shade, **kw):
-    """Parameters as a Mitsuba dict entry. Never a closure: register_bsdf is a no-op after
-    the first call, so a captured model renders the first material for every later one."""
-    p = dict(DEFAULTS, **kw)
-    d = {"type": "mtoon"}
-    for i, name in enumerate("rgb"):
-        d["base_" + name] = float(base[i])
-        d["shade_" + name] = float(shade[i])
-        d["rim_" + name] = float(p["parametric_rim_color_factor"][i])
-    for k in PROP_KEYS:
-        d[k] = float(p[k])
-    return d
+def evaluate_wide(dot_nl, dot_nv, base, shade, light_color=(1.0, 1.0, 1.0), **kw):
+    """`evaluate`, in Dr.Jit ops, so a Mitsuba integrator widens it over a whole film.
 
+    Same model as `evaluate` and as mtoon.slang's `mtoonEvaluate`; check_mtoon_render.py
+    holds this against `evaluate`, and check_mtoon_slang.py holds `evaluate` against the
+    Slang kernel. One model, three evaluation widths, both joins gated.
 
-_REGISTERED = False
-
-
-def register():
-    """Register once; Mitsuba ignores repeats, so this does too."""
-    global _REGISTERED
-    if _REGISTERED:
-        return
+    `dot_nl` and `dot_nv` are Dr.Jit floats. Returns an mi.Color3f. drjit and mitsuba are
+    imported here, not at module scope, so mtoon.py stays importable without them --
+    check_mtoon_slang.py imports this module with neither installed.
+    """
+    import drjit as dr
     import mitsuba as mi
 
-    class _Plugin(mi.BSDF):
-        def __init__(self, props):
-            mi.BSDF.__init__(self, props)
-            self.m_flags = mi.BSDFFlags.DiffuseReflection | mi.BSDFFlags.FrontSide
-            self.m_components = [self.m_flags]
-            g = lambda k, d=0.0: float(props.get(k, d))  # noqa: E731
-            self.base = np.array([g("base_" + c) for c in "rgb"])
-            self.shade = np.array([g("shade_" + c) for c in "rgb"])
-            self.kw = dict(DEFAULTS)
-            self.kw["parametric_rim_color_factor"] = tuple(g("rim_" + c) for c in "rgb")
-            for k in PROP_KEYS:
-                self.kw[k] = g(k, DEFAULTS[k])
+    p = dict(DEFAULTS, **kw)
+    toony = min(max(float(p["shading_toony_factor"]), 0.0), 1.0)
+    lo, hi = -1.0 + toony, 1.0 - toony
+    s = dot_nl + float(p["shading_shift_factor"]) + float(p["shading_shift_texture"])
+    if abs(hi - lo) <= EPS:
+        t = dr.select(s >= lo, mi.Float(1.0), mi.Float(0.0))
+    else:
+        t = dr.clip((s - lo) / (hi - lo), 0.0, 1.0)
 
-        def _value(self, si, wo):
-            nl = float(np.array(mi.Frame3f.cos_theta(wo)).reshape(-1)[0])
-            nv = float(np.array(mi.Frame3f.cos_theta(si.wi)).reshape(-1)[0])
-            col, _ = evaluate(nl, nv, self.base, self.shade, **self.kw)
-            return list(col / math.pi)
+    light = mi.Color3f(*[float(c) for c in light_color])
+    col = (mi.Color3f(*[float(c) for c in shade])
+           + (mi.Color3f(*[float(c) for c in base])
+              - mi.Color3f(*[float(c) for c in shade])) * t) * light
 
-        def sample(self, ctx, si, sample1, sample2, active=True):
-            bs = mi.BSDFSample3f()
-            bs.wo = mi.warp.square_to_cosine_hemisphere(sample2)
-            bs.pdf = mi.warp.square_to_cosine_hemisphere_pdf(bs.wo)
-            bs.eta, bs.sampled_type = 1.0, +mi.BSDFFlags.DiffuseReflection
-            bs.sampled_component = 0
-            return bs, mi.Spectrum(self._value(si, bs.wo))
-
-        def eval(self, ctx, si, wo, active=True):
-            return mi.Spectrum(self._value(si, wo))
-
-        def pdf(self, ctx, si, wo, active=True):
-            return mi.warp.square_to_cosine_hemisphere_pdf(wo)
-
-        def eval_pdf(self, ctx, si, wo, active=True):
-            return self.eval(ctx, si, wo, active), self.pdf(ctx, si, wo, active)
-
-        def to_string(self):
-            return "MToon[]"
-
-    mi.register_bsdf("mtoon", lambda props: _Plugin(props))
-    _REGISTERED = True
+    r = dr.clip(1.0 - dot_nv + float(p["parametric_rim_lift_factor"]), 0.0, 1.0)
+    r = dr.power(r, max(float(p["parametric_rim_fresnel_power_factor"]), EPS))
+    white = mi.Color3f(1.0, 1.0, 1.0)
+    mix = float(p["rim_lighting_mix_factor"])
+    rim = (mi.Color3f(*[float(c) for c in p["parametric_rim_color_factor"]]) * r
+           * (white + (light - white) * mix))
+    return col + rim
 
 
 def sweep(samples=64, **kw):

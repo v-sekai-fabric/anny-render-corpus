@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
-"""The MToon sweep. MToon is not a BSDF: its shade colour is painted where dot(N, L) < 0,
-where a physically based integrator contributes nothing, so a BSDF renders lit-to-black and
-the shade plateau never appears. The commit message carries the measurement.
+"""The MToon sweep, rendered through the one MToon renderer (mtoon_forward).
+
+MToon is not a BSDF: its shade colour is painted where dot(N, L) < 0, where a physically
+based integrator contributes nothing, so a BSDF renders lit-to-black and the shade plateau
+never appears. This module used to drive exactly that broken BSDF and pin its breakage --
+its flat-material control asserted contrast > 1.0 where a correct renderer must produce
+none. Retired 2026-09-06 in favour of mtoon_forward; the control now asserts flatness.
 
     python mtoon_sweep.py [--self-test]
 """
@@ -43,33 +47,38 @@ def solve_multiplier(lit, target):
 
 
 def render_sphere(lit, shade, res=128, **params):
-    """One sphere, one directional light."""
-    import mitsuba as mi
-    mtoon.register()
-    scene = mi.load_dict({
-        "type": "scene",
-        "integrator": {"type": "direct", "emitter_samples": 1, "bsdf_samples": 0},
-        "sensor": {
-            "type": "perspective", "fov": 40,
-            "to_world": mi.ScalarTransform4f().look_at(
-                origin=[0, 0, 5], target=[0, 0, 0], up=[0, 1, 0]),
-            "film": {"type": "hdrfilm", "width": res, "height": res,
-                     "rfilter": {"type": "box"}, "pixel_format": "rgb"},
-            "sampler": {"type": "independent", "sample_count": 16},
-        },
-        "ball": {"type": "sphere", "radius": 1.0,
-                 "bsdf": mtoon.scene_dict(lit, shade, **params)},
-        "sun": {"type": "directional", "direction": [-1, -0.2, -0.6],
-                "irradiance": {"type": "rgb", "value": math.pi}},
-    })
-    return np.array(mi.render(scene, spp=16))
+    """One sphere, one key light, through the shared MToon renderer.
+
+    `direction=[-1,-0.2,-0.6]` on the old directional emitter is the direction the light
+    travels, so the direction *to* the light is [1, 0.2, 0.6] -- mtoon_forward's default.
+    No occluder: the sweep reads plateaus off an unshadowed body.
+    """
+    import mtoon_forward as forward
+    img = forward.render(lit, shade, width=res, height=res, spp=16,
+                         shape=None, occluder=False, **params)
+    return np.asarray(img)
 
 
 def plateaus(image):
-    """Brightest and darkest tenth of the lit body."""
-    flat = image.reshape(-1, 3)
-    luma = flat @ np.array([0.2126, 0.7152, 0.0722])
-    body = flat[luma > 1e-6]
+    """Brightest and darkest tenth of the body.
+
+    Selects fully covered pixels when the film carries alpha. Two traps, both of which
+    manufacture contrast that a flat material does not have:
+
+      * selecting by luma admits the antialiased silhouette outright;
+      * the film is PREMULTIPLIED, so a half-covered edge pixel carries half the body
+        colour. `alpha > 0.5` therefore still admits pixels darkened by coverage alone --
+        at spp=16 that put the darkest tenth at 0.38 of a 0.68 body. Only `alpha ~= 1`
+        is safe. (mtoon_forward's own flat control escapes this because it renders at
+        spp=1, where coverage is binary; the bug is invisible there.)
+    """
+    image = np.asarray(image)
+    if image.shape[-1] >= 4:
+        flat = image.reshape(-1, image.shape[-1])
+        body = flat[flat[:, 3] > 0.999][:, :3]
+    else:
+        flat = image.reshape(-1, 3)
+        body = flat[flat @ np.array([0.2126, 0.7152, 0.0722]) > 1e-6]
     if len(body) < 20:
         return None, None
     order = np.argsort(body @ np.array([0.2126, 0.7152, 0.0722]))
@@ -115,8 +124,8 @@ def self_test():
 
     flat = render_sphere(lit, lit, res=64, shading_toony_factor=1.0)
     fhi, flo = plateaus(flat)
-    r.append(("the shade plateau does NOT reach the render, as the docstring says",
-              fhi is not None and mtoon.delta_e(list(fhi), list(flo)) > 1.0))
+    r.append(("base == shade renders flat, which the retired BSDF could not do",
+              fhi is not None and mtoon.delta_e(list(fhi), list(flo)) < 1.0))
 
     dark = render_sphere([c * 0.25 for c in lit], [c * 0.1 for c in lit], res=64)
     dhi, _ = plateaus(dark)
@@ -148,8 +157,8 @@ def main():
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
-    import mitsuba as mi
-    mi.set_variant("scalar_rgb")
+    import mtoon_forward as forward
+    forward.set_wide_variant()
     if args.self_test:
         return self_test()
 
